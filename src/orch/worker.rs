@@ -127,31 +127,91 @@ pub(crate) fn run(args: &[String]) -> Result<i32> {
     Ok(status.code().unwrap_or(1))
 }
 
+/// How many times the runner re-reads a task whose revision moved before the
+/// start failure could be recorded.
+const FAIL_UNSTARTED_TRIES: usize = 3;
+
+#[derive(Debug, PartialEq, Eq)]
+enum UnstartedOutcome {
+    /// The task was marked failed.
+    Failed,
+    /// The task no longer belongs to this pane's running attempt.
+    Changed,
+    /// Other mutations kept winning; the task was left untouched.
+    Conflicted,
+    Error(String),
+}
+
 /// A task whose agent never started has no process left to settle it, so the
 /// runner records the failure instead of leaving the task `running`. The task
 /// may have changed while the agent was starting (completed, blocked, retried
 /// or reassigned); only the attempt this pane still owns is marked failed.
 fn fail_unstarted(task_id: &str, pane: u32, attempt: u64, detail: &str) {
-    match fetch_task(task_id) {
-        Ok(task) if owns_running_attempt(&task, pane, attempt) => {}
-        Ok(_) => {
-            eprintln!("task {task_id} changed while its agent was starting; leaving it as is");
-            return;
+    match fail_unstarted_with(task_id, pane, attempt, detail, crate::cli::send_request) {
+        UnstartedOutcome::Failed => {}
+        UnstartedOutcome::Changed => {
+            eprintln!("task {task_id} changed while its agent was starting; leaving it as is")
         }
-        Err(error) => {
-            eprintln!("could not mark task {task_id} failed: {error}");
-            return;
+        UnstartedOutcome::Conflicted => eprintln!(
+            "could not mark task {task_id} failed: its state kept changing; leaving it as is"
+        ),
+        UnstartedOutcome::Error(error) => {
+            eprintln!("could not mark task {task_id} failed: {error}")
         }
     }
-    let response = crate::cli::send_request(
-        "task.update",
-        json!({"id":task_id, "status":"failed", "output":detail}),
-    );
-    match response {
-        Ok(response) if response.get("error").is_none() => {}
-        Ok(response) => eprintln!("could not mark task {task_id} failed: {response}"),
-        Err(error) => eprintln!("could not mark task {task_id} failed: {error}"),
+}
+
+/// Read the task, check that this pane still owns the running attempt, and
+/// mark it failed only if no other mutation landed since that read. The
+/// server applies `if_revision` and the update in one app-loop step, so the
+/// ownership check and the write are atomic; a conflict re-reads and decides
+/// again.
+fn fail_unstarted_with(
+    task_id: &str,
+    pane: u32,
+    attempt: u64,
+    detail: &str,
+    mut send: impl FnMut(&str, serde_json::Value) -> Result<serde_json::Value>,
+) -> UnstartedOutcome {
+    for _ in 0..FAIL_UNSTARTED_TRIES {
+        let response = match send("task.get", json!({"id":task_id})) {
+            Ok(response) => response,
+            Err(error) => return UnstartedOutcome::Error(error.to_string()),
+        };
+        if let Some(error) = response.get("error") {
+            return UnstartedOutcome::Error(format!("could not load manual task: {error}"));
+        }
+        let result = response.get("result");
+        let Some(task) = result.and_then(|result| result.get("task")) else {
+            return UnstartedOutcome::Error(format!(
+                "manual task snapshot is unavailable: {task_id}"
+            ));
+        };
+        if !owns_running_attempt(task, pane, attempt) {
+            return UnstartedOutcome::Changed;
+        }
+        let Some(revision) = result
+            .and_then(|result| result.get("revision"))
+            .and_then(|revision| revision.as_u64())
+        else {
+            return UnstartedOutcome::Error("task snapshot has no revision".to_string());
+        };
+        let response = match send(
+            "task.update",
+            json!({"id":task_id, "status":"failed", "output":detail, "if_revision":revision}),
+        ) {
+            Ok(response) => response,
+            Err(error) => return UnstartedOutcome::Error(error.to_string()),
+        };
+        match response.get("error") {
+            None => return UnstartedOutcome::Failed,
+            Some(error)
+                if error.get("code").and_then(|code| code.as_str())
+                    == Some("revision_conflict") => {}
+            Some(error) => return UnstartedOutcome::Error(error.to_string()),
+        }
     }
+    UnstartedOutcome::Conflicted
 }
 
 fn take(pane: crate::ids::PaneId) -> Result<ManualLaunchSpec> {
@@ -411,6 +471,135 @@ mod tests {
         assert!(!owns_running_attempt(&task("running", None, 2), 7, 2));
         assert!(!owns_running_attempt(&task("running", Some(7), 3), 7, 2));
         assert!(!owns_running_attempt(&json!({"status":"running"}), 7, 2));
+    }
+
+    type SentLog = std::rc::Rc<std::cell::RefCell<Vec<(String, serde_json::Value)>>>;
+
+    /// Replay scripted server responses and record every request sent.
+    fn scripted(
+        responses: Vec<serde_json::Value>,
+    ) -> (
+        impl FnMut(&str, serde_json::Value) -> Result<serde_json::Value>,
+        SentLog,
+    ) {
+        let sent = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let log = sent.clone();
+        let mut responses = responses.into_iter();
+        let send = move |method: &str, params: serde_json::Value| {
+            log.borrow_mut().push((method.to_string(), params));
+            responses
+                .next()
+                .ok_or_else(|| anyhow!("unexpected request: {method}"))
+        };
+        (send, sent)
+    }
+
+    fn task_get(status: &str, revision: u64) -> serde_json::Value {
+        json!({"result":{"type":"task", "revision":revision,
+            "task":{"id":"t1", "status":status, "assignee":7, "attempt":2}}})
+    }
+
+    fn conflict() -> serde_json::Value {
+        json!({"error":{"code":"revision_conflict", "message":"socket state changed"}})
+    }
+
+    #[test]
+    fn an_unstarted_task_still_owned_is_failed_at_the_read_revision() {
+        let (send, sent) = scripted(vec![
+            task_get("running", 41),
+            json!({"result":{"type":"task"}}),
+        ]);
+        assert_eq!(
+            fail_unstarted_with("t1", 7, 2, "program not found", send),
+            UnstartedOutcome::Failed
+        );
+        let sent = sent.borrow();
+        assert_eq!(sent.len(), 2);
+        assert_eq!(sent[1].0, "task.update");
+        assert_eq!(
+            sent[1].1,
+            json!({"id":"t1", "status":"failed", "output":"program not found", "if_revision":41})
+        );
+    }
+
+    #[test]
+    fn an_unstarted_task_that_changed_is_left_alone() {
+        for status in ["done", "blocked", "review", "queued"] {
+            let (send, sent) = scripted(vec![task_get(status, 5)]);
+            assert_eq!(
+                fail_unstarted_with("t1", 7, 2, "x", send),
+                UnstartedOutcome::Changed,
+                "{status}"
+            );
+            assert_eq!(sent.borrow().len(), 1, "{status}");
+        }
+    }
+
+    #[test]
+    fn a_revision_conflict_rereads_and_decides_again() {
+        // Unrelated mutation first: the task is still ours, so retry.
+        let (send, sent) = scripted(vec![
+            task_get("running", 5),
+            conflict(),
+            task_get("running", 6),
+            json!({"result":{"type":"task"}}),
+        ]);
+        assert_eq!(
+            fail_unstarted_with("t1", 7, 2, "x", send),
+            UnstartedOutcome::Failed
+        );
+        assert_eq!(sent.borrow()[3].1["if_revision"], 6);
+
+        // The conflicting mutation completed the task: leave it.
+        let (send, sent) = scripted(vec![
+            task_get("running", 5),
+            conflict(),
+            task_get("done", 6),
+        ]);
+        assert_eq!(
+            fail_unstarted_with("t1", 7, 2, "x", send),
+            UnstartedOutcome::Changed
+        );
+        assert_eq!(sent.borrow().len(), 3);
+    }
+
+    #[test]
+    fn exhausted_revision_conflicts_leave_the_task_untouched() {
+        let mut responses = Vec::new();
+        for revision in 0..FAIL_UNSTARTED_TRIES as u64 {
+            responses.push(task_get("running", revision));
+            responses.push(conflict());
+        }
+        let (send, sent) = scripted(responses);
+        assert_eq!(
+            fail_unstarted_with("t1", 7, 2, "x", send),
+            UnstartedOutcome::Conflicted
+        );
+        let sent = sent.borrow();
+        assert_eq!(sent.len(), 2 * FAIL_UNSTARTED_TRIES);
+        assert!(sent
+            .iter()
+            .filter(|(method, _)| method == "task.update")
+            .all(|(_, params)| params.get("if_revision").is_some()));
+    }
+
+    #[test]
+    fn other_update_errors_and_missing_revisions_are_reported() {
+        let (send, _) = scripted(vec![
+            task_get("running", 5),
+            json!({"error":{"code":"task_complete", "message":"t1 is already merged"}}),
+        ]);
+        assert!(matches!(
+            fail_unstarted_with("t1", 7, 2, "x", send),
+            UnstartedOutcome::Error(error) if error.contains("task_complete")
+        ));
+        let (send, sent) = scripted(vec![json!({"result":{"task":
+            {"id":"t1", "status":"running", "assignee":7, "attempt":2}}})]);
+        assert!(matches!(
+            fail_unstarted_with("t1", 7, 2, "x", send),
+            UnstartedOutcome::Error(error) if error.contains("revision")
+        ));
+        assert_eq!(sent.borrow().len(), 1);
     }
 
     #[test]
